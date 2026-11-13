@@ -1,0 +1,11 @@
+.venv/
+.bootstrap/
+.python/
+.cache/
+.env
+data/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
