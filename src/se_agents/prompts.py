@@ -6,6 +6,62 @@ ROLES = {
 }
 
 TASKS = {
+    "internal_resolution": (
+        "根据用户目标与约束、候选方案和各角色的交叉评价，提出价值冲突与方案取舍的工作决定。"
+        "只在 decisions 中填写有充分依据且无需改变用户约束的决定，每条引用给定 issue_id。"
+        "choice 写拟采用的做法，rationale 写理由。最多处理 32 条，优先重大问题。"
+        "无法判断的取舍留空，留待后续评分或确认。"
+        "不要宣称已验证外部事实，不处理事实异议，不代替用户确认最终方案。"
+    ),
+    "requirements_spec": (
+        "基于已选方案、各角色评价和人工决策，整理可确认的需求规格。"
+        "保留来源，需求使用 R01、R02 这样的唯一编号、Must/Should/Could 和可检验验收标准。"
+        "模块给编号、职责和需求编号，接口给端点模块与约定。"
+        "此处模块与接口作为概要，不应擅自扩大选定范围。"
+        "未知事实放入 assumptions，不能把推演当已验证的调研。"
+    ),
+    "engineering_design": (
+        "你负责把输入的设计规格整理为结构化设计基线，保留产品特有的模块、接口和约束。"
+        "从原始设计中提取需求，保留已有编号；未有编号时赋予 R01、MOD01、IF01 等稳定编号。"
+        "每个模块必须关联需求，每条 Must 需求都由模块承接，接口的模块端点必须存在。"
+        "外部系统接口可用 target_module=null 并在 contract 中注明外部依赖。"
+        "如果输入有已确认需求，必须逐字保留这些需求、编号、优先级和验收标准。"
+        "缺少的信息明确列在 assumptions 中，避免默认引入新业务功能。"
+    ),
+    "task_decompose": (
+        "你是 PM Agent，根据已确认设计规格分解开发任务，输出可供程序编排的任务计划。"
+        "任务使用 T001 等唯一编号，逐项写明 owner、kind、requirement_ids、module_ids、"
+        "depends_on、deliverables、done_criteria、estimate_hours 和 priority。"
+        "每项都返回完整任务字段，尤其是 estimate_hours 和 priority。"
+        "done_criteria 通常写 2–6 项，最多 16 项。保留不同的验收行为，合并重复描述。"
+        "对照需求到模块的映射，确保任务每条需求至少由该任务所列一个模块承接。"
+        "kind 为 code/test/doc/research/human。human 只给人工执行，其他 owner 可写角色名称。"
+        "每任务不超过16小时，每条Must需求必须有实现任务并有test或human验收任务承接。"
+        "不要用模块覆盖替代逐条需求覆盖。完成标准应指向具体行为、测试或文档检查。"
+        "依赖可引用后面的任务，程序会排序；不要凭空制造串行依赖，独立模块允许并行。"
+        "代码和测试 deliverables 为项目相对路径，接口、数据初始化等共同依赖应先安排。"
+        "收到修改意见时重新输出完整计划，优先修改点名的任务和直接受影响的依赖。"
+        "保持仍适用任务的编号，已经确认的范围和契约不得擅自改写。"
+    ),
+    "plan_review": (
+        "你独立检查任务计划是否完整承接设计规格，依赖是否合理，完成标准能否验收。"
+        "对照每条Must需求、模块接口和测试任务，指出具体遗漏、语义依赖错误及越界任务。"
+        "重大缺陷用 major，建议用 minor。task_id 引用实际任务，整体问题可为null。"
+        "重大问题说明受影响的已确认需求、接口或依赖。不得把可选范围或新建议当成必需需求。"
+        "程序已检查编号、引用和循环依赖，你重点检查语义。没有问题可返回空findings。"
+    ),
+    "task_execute": (
+        "根据当前已确认任务卡交付本任务产物，复用前置任务源码并遵循设计接口。"
+        "返回完整项目相对路径与文件内容、summary、evidence。"
+        "完成标准中需实际运行的测试，如果本轮仅产出源码，明确写待实际运行，禁止编造结果。"
+        "只修改本任务指定的交付文件，不修改任务卡、依赖和验收标准。"
+        "接到缺陷后针对缺陷修复，输出完整文件。"
+    ),
+    "task_review": (
+        "你独立检查本任务产物是否满足任务卡、设计约定及前置接口。"
+        "仅做静态审查，不得宣称运行过测试。明确指出遗漏文件、不可运行实现和接口错误。"
+        "findings为空表示本轮静态检查未提出缺陷，实际验收仍需人工提交证据。"
+    ),
     "project_probe": (
         "构建前核对已确认报告和此前的澄清。最多问一个仍有多种合理实现、"
         "且用户取舍会明显影响实际业务流程或使用体验的问题。"
@@ -116,21 +172,36 @@ TASKS = {
         "对应 audience、goal、constraints。每个非空值必须是用户原话中连续的原文，"
         "只摘录最相关的片段。未明确的字段为 null，不补猜测。"
     ),
-    "diverge": "独立提出 0–3 个实质不同的方案。note 解释你的视角。用 assumptions 标记未验证条件。",
+    "diverge": (
+        "独立提出 0–3 个实质不同的方案。note 解释你的视角。用 assumptions 标记未验证条件。"
+        "若有 feedback，结合用户退回意见重新构思，并解释方案如何回应意见。"
+    ),
     "critique": (
-        "严格输出三个顶层字段 reviews、objections、checked_assumptions。"
+        "只审查本批 options 中的候选。输出 reviews、objections、checked_assumptions。"
         "reviews 只对 review_target_ids 逐条评价，每个编号正好一次。"
         "若目标为空，必须返回 reviews: []，仍可在 objections 中指出候选方案的问题。"
         "每条评价包含 claim_id、stance（agree、oppose 或 conditional）和 reason。"
         "每条异议填写 option_id、assumption_id（无则 null）、"
         "kind（factual、value 或 tradeoff）、severity（major 或 minor）、reason、action。"
-        "假设必须属于同一方案。没有异议时 objections 为 []。"
-        "checked_assumptions 原样复制 required_checked_assumption_ids，包括空列表。"
+        "假设必须属于同一方案。优先保留会影响决策的问题，合并重复异议。"
+        "objections 最多 16 条，没有异议用空数组。"
+        "质疑者检查 required_checked_assumption_ids，只在 checked_assumptions 中填写实际检查的编号。"
+        "如无法完成某项检查，保留已经写好的评审和异议，未填写的编号将单独补查。"
+        "其他角色在没有检查编号时可返回空数组。"
+    ),
+    "critique_assumption": (
+        "仅审查输入中的这一项关键假设。输出 reason 和 action 两个文本字段。"
+        "reason 说明假设未被证明时会影响该方案的哪一部分以及还缺什么证据。"
+        "action 给出可执行的验证步骤和通过标准。不要输出编号或判断已经核实。"
     ),
     "score": (
-        "为每个候选给出五个维度的评分、各维依据和立场。所有维度越高越好，"
-        "1=很弱、3=可行但有不确定性、5=依据充分。不知道用 null。"
-        "conditional 必须引用关联的假设或异议 ID。用户材料中的判断须注明来源。"
+        "仅对 options 中本批候选逐项评分，每个 option_id 正好出现一次。"
+        "scores 和 reasons 都必须使用相同的五个英文键 value、feasibility、cost、fit、risk。"
+        "分数为 1–5 的整数，资料不足用 null，reasons 对应解释原因，每项简短具体。"
+        "不要增加 fit_note、reasons_extra 等字段。"
+        "有条件支持使用 conditional，condition_ids 只复制该候选 allowed_conditions 的编号，"
+        "至少一个且不重复。没有适用编号时，资料不足用 abstain，明确不支持用 oppose。"
+        "无条件立场用空的 condition_ids。用户材料中的判断须注明来源。"
     ),
     "signoff": (
         "审阅当前 Proposal 和对应未解决的异议。返回 approve、conditional 或 reject，"
@@ -147,4 +218,4 @@ COMMON = (
     "面向用户的标题、说明和建议请使用简体中文，保留必要的专有名词。"
     "区分事实、推测与待核查事项。只输出符合 schema 的一个 JSON 对象，"
 )
-BASE = COMMON + '例如 schema 需要 note 时写 {"note":"理由"} 并补齐其他必需字段。'
+BASE = COMMON + "补齐 schema 的必填字段，不附加未定义字段，不使用 Markdown 代码块包装。"

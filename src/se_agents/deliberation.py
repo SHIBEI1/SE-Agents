@@ -3,9 +3,9 @@ from __future__ import annotations
 from .schemas import (
     DIMENSIONS,
     ROLES,
-    WEIGHTS,
     Assessment,
     Assumption,
+    AssumptionReview,
     Blackboard,
     Claim,
     Critique,
@@ -57,8 +57,9 @@ def shortlisted(board: Blackboard) -> list[Option]:
     return [item for item in board.options if item.id in board.shortlist]
 
 
-def critique_input(board: Blackboard) -> dict:
-    options = shortlisted(board)
+def critique_input(board: Blackboard, options: list[Option] | None = None) -> dict:
+    if options is None:
+        options = shortlisted(board)
     ids = {option.id for option in options}
     return {
         "idea": board.idea,
@@ -81,7 +82,9 @@ def critique_targets(payload: dict, role: Role) -> dict:
     }
 
 
-def validate_critique(role: Role, payload: dict, reply: Critique) -> None:
+def validate_critique(
+    role: Role, payload: dict, reply: Critique, *, allow_missing_checks: bool = False
+) -> None:
     authors = {item["id"]: item["author"] for item in payload["claims"] if item["author"] != role}
     reviewed_ids = [item.claim_id for item in reply.reviews]
     if len(set(reviewed_ids)) != len(reviewed_ids) or any(
@@ -97,13 +100,15 @@ def validate_critique(role: Role, payload: dict, reply: Critique) -> None:
         ):
             raise ValueError("异议引用无效。")
     critical = set(payload["critical_ids"])
-    if not set(reply.checked_assumptions) <= critical or (
-        role == "devil" and not critical <= set(reply.checked_assumptions)
-    ):
-        raise ValueError("关键假设检查不完整。")
+    checked = set(reply.checked_assumptions)
+    expected = critical if role == "devil" else set()
+    if not checked <= critical or (not allow_missing_checks and not expected <= checked):
+        missing = "、".join(sorted(expected - checked)) or "无"
+        invalid = "、".join(sorted(checked - critical)) or "无"
+        raise ValueError(f"checked_assumptions 缺少必查编号：{missing}。超出本批的编号：{invalid}。")
 
 
-def record_objections(board: Blackboard) -> None:
+def record_objections(board: Blackboard, assumption_reviews: dict[str, AssumptionReview]) -> None:
     for role in ROLES:
         for issue in board.critiques[role].objections:
             board.objections.append(
@@ -127,16 +132,17 @@ def record_objections(board: Blackboard) -> None:
                 for item in board.objections
             ):
                 continue
+            review = assumption_reviews.get(assumption.id)
             board.objections.append(
                 Objection(
                     id=f"OBJ-{len(board.objections) + 1:03}",
-                    author="program",
+                    author="devil" if review else "program",
                     option_id=option.id,
                     assumption_id=assumption.id,
                     kind="factual",
                     severity="major",
-                    reason=assumption.statement,
-                    action=assumption.verification_plan,
+                    reason=review.reason if review else assumption.statement,
+                    action=review.action if review else assumption.verification_plan,
                     status="needs_evidence",
                 )
             )
@@ -161,19 +167,24 @@ def valid_conditions(refs: list[str], status: dict[str, bool], required: bool) -
     )
 
 
-def validate_score(board: Blackboard, score: Scorecard) -> None:
-    expected = set(board.shortlist)
+def validate_score(board: Blackboard, score: Scorecard, option_ids: list[str]) -> None:
+    expected = set(option_ids)
     actual = [item.option_id for item in score.assessments]
     if set(actual) != expected or len(actual) != len(expected):
-        raise ValueError("必须对每个候选评分一次。")
+        raise ValueError(f"必须对本批候选各评分一次：{'、'.join(option_ids)}。")
     for item in score.assessments:
         status = condition_status(board, item.option_id)
-        if item.reasons.keys() != WEIGHTS.keys() or not valid_conditions(
+        if not valid_conditions(
             item.condition_ids,
             status,
             item.stance == "conditional",
         ):
-            raise ValueError("评分依据或条件引用不完整。")
+            allowed = "、".join(status) or "无"
+            raise ValueError(
+                f"{item.option_id} 的 condition_ids 缺失、重复或越界。"
+                f"本方案有效编号：{allowed}。有条件支持须引用至少一个有效编号；"
+                "若没有可引用条件且无法无条件支持，请用 abstain。"
+            )
 
 
 def option_assessments(board: Blackboard, option_id: str) -> list[Assessment]:
@@ -285,6 +296,13 @@ def compose(board: Blackboard, option_id: str, weights: dict[str, float]) -> Pro
         "决策依据": f"{decision.id} 选择 {option.id}。{decision.reason}\n\n"
         f"关联论点：{', '.join(option.claim_ids)}",
     }
+    related_decisions = {item.decision_id for item in related_issues}
+    tradeoffs = [item for item in board.decisions if item.id in related_decisions
+                 and item.actor == "agent"]
+    if tradeoffs:
+        sections["讨论中的取舍"] = "\n".join(
+            f"- {item.value['choice']}。依据：{item.reason}" for item in tradeoffs
+        )
     return Proposal(option_id=option_id, sections=sections, dependency_hash=digest(dependencies))
 
 

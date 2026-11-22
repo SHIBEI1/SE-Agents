@@ -1,23 +1,40 @@
 from __future__ import annotations
 
 import operator
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, TypedDict, TypeVar
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Overwrite, interrupt
 
 from . import deliberation as rules
 from .chat import frame_notes
 from .human import validate_answer
 from .models import ModelError, ModelRunner
+from .planning import (
+    DesignSpecification,
+    DevelopmentPlan,
+    PlanEdit,
+    PlanReview,
+    ScheduledTask,
+    TaskProgress,
+    edited_plan,
+    fingerprint,
+    refresh_ready,
+    schedule,
+    validate_plan,
+    validate_spec,
+)
 from .project import generate_files, recover_project, write_project
 from .reporting import export_markdown
 from .schemas import (
     ROLES,
+    AssumptionReview,
     Blackboard,
     Critique,
+    CritiqueBatch,
     Decision,
     DesignProbe,
     DesignQuestion,
@@ -28,6 +45,7 @@ from .schemas import (
     Role,
     Scorecard,
     Signoff,
+    TradeoffDecisions,
     digest,
 )
 from .storage import Store
@@ -42,6 +60,7 @@ class GraphState(TypedDict, total=False):
     branches: Annotated[list[str], operator.add]
     halt: bool
     revise: bool
+    plan_action: str
 
 
 class ProjectDecisionStopped(Exception):
@@ -76,6 +95,14 @@ class Workshop:
     def build(self, checkpointer):
         graph = StateGraph(GraphState)
         stages = {
+            "requirements_spec": self.requirements_spec,
+            "requirements_confirm": self.requirements_confirm,
+            "engineering_design": self.engineering_design,
+            "design_confirm": self.design_confirm,
+            "task_decompose": self.task_decompose,
+            "plan_review": self.plan_review,
+            "plan_confirm": self.plan_confirm,
+            "orchestrate": self.orchestrate,
             "design_probe": self.design_probe,
             "design_clarify": self.design_clarify,
             "technical_report": self.technical_report,
@@ -92,6 +119,8 @@ class Workshop:
             "draft": self.draft,
             "signoff": self.signoff,
             "revise": self.revise,
+            "proposal_confirm": self.proposal_confirm,
+            "reopen_discussion": self.reopen_discussion,
         }
         for name, fn in stages.items():
             graph.add_node(name, fn)
@@ -101,7 +130,7 @@ class Workshop:
         graph.add_conditional_edges(
             START,
             self.initial_stage,
-            ["design_probe", "frame", "project_probe"],
+            ["design_probe", "frame", "project_probe", "engineering_design"],
         )
         graph.add_edge("design_probe", "design_clarify")
         graph.add_conditional_edges(
@@ -109,7 +138,46 @@ class Workshop:
             lambda state: END if state.get("halt") else "technical_report",
             [END, "technical_report"],
         )
-        graph.add_edge("technical_report", END)
+        graph.add_conditional_edges(
+            "technical_report",
+            lambda state: "engineering_design" if self.flow_mode(state) == "full" else END,
+            ["engineering_design", END],
+        )
+        graph.add_edge("requirements_spec", "requirements_confirm")
+        graph.add_conditional_edges(
+            "requirements_confirm",
+            lambda state: END if state.get("halt") else (
+                "requirements_spec" if state.get("revise") else "technical_report"
+            ),
+            [END, "requirements_spec", "technical_report"],
+        )
+        graph.add_edge("engineering_design", "design_confirm")
+        graph.add_conditional_edges(
+            "design_confirm",
+            lambda state: END if state.get("halt") else (
+                "engineering_design" if state.get("revise") else "task_decompose"
+            ),
+            [END, "engineering_design", "task_decompose"],
+        )
+        graph.add_edge("task_decompose", "plan_review")
+        graph.add_conditional_edges(
+            "plan_review",
+            lambda state: END if state.get("halt") else (
+                "task_decompose" if state.get("revise") else
+                "orchestrate" if state.get("plan_action") == "approved" else "plan_confirm"
+            ),
+            [END, "task_decompose", "plan_confirm", "orchestrate"],
+        )
+        graph.add_conditional_edges(
+            "plan_confirm",
+            lambda state: END if state.get("halt") else (
+                "task_decompose" if state.get("revise") else {
+                    "saved": "plan_confirm", "review": "plan_review",
+                }.get(state.get("plan_action"), "orchestrate")
+            ),
+            [END, "task_decompose", "orchestrate", "plan_confirm", "plan_review"],
+        )
+        graph.add_edge("orchestrate", END)
         graph.add_edge("project_probe", "project_clarify")
         graph.add_conditional_edges(
             "project_clarify",
@@ -139,16 +207,247 @@ class Workshop:
             )
         graph.add_conditional_edges(
             "signoff",
-            lambda state: "revise" if state.get("revise") else END,
-            ["revise", END],
+            self.after_signoff,
+            ["revise", "proposal_confirm", "requirements_spec", END],
         )
         graph.add_edge("revise", "signoff")
+        graph.add_conditional_edges(
+            "proposal_confirm",
+            lambda state: END if state.get("halt") else (
+                "reopen_discussion" if state.get("revise") else "requirements_spec"
+            ),
+            [END, "reopen_discussion", "requirements_spec"],
+        )
+        graph.add_edge("reopen_discussion", "frame")
         return graph.compile(checkpointer=checkpointer)
 
     def initial_stage(self, state: GraphState) -> str:
         if self.store.board(state["run_id"], state["revision"]).project_build:
             return "project_probe"
+        if self.flow_mode(state) == "planning":
+            return "engineering_design"
+        if self.flow_mode(state) == "full":
+            return "frame"
         return "design_probe" if self.model.config.technical_mode else "frame"
+
+    def flow_mode(self, state: GraphState) -> str:
+        engineering = self.store.board(state["run_id"], state["revision"]).engineering
+        if engineering is None:
+            return "legacy"
+        return "planning" if engineering.source_text else "full"
+
+    def after_signoff(self, state: GraphState) -> str:
+        if state.get("revise"):
+            return "revise"
+        if self.model.config.internal_deliberation:
+            return "proposal_confirm"
+        board = self.store.board(state["run_id"], state["revision"])
+        if self.flow_mode(state) == "full" and board.outcome == "completed":
+            return "requirements_spec"
+        return END
+
+    def proposal_confirm(self, state: GraphState) -> GraphState:
+        board = self.load(state, "proposal_confirm")
+        snapshot = digest(board.proposal.model_dump())
+        answer = self.ask(state, "proposal_confirm", snapshot[:12], {
+            "snapshot": snapshot,
+            "needs_risk_ack": bool(board.proposal_review_issues),
+        })
+        if answer["value"] == {"stop": True}:
+            return self.user_stop(state, "proposal_confirm", board, answer)
+        self.log_decision(board, "proposal_confirm", answer)
+        return self.commit(state, "proposal_confirm", board, revise=not answer["value"]["approve"])
+
+    def reopen_discussion(self, state: GraphState) -> GraphState:
+        board = self.load(state, "reopen_discussion")
+        decision = board.decisions[-1]
+        board.engineering.feedback.append(decision.value["feedback"])
+        board.divergence_notes.clear()
+        board.claims.clear()
+        board.options.clear()
+        board.shortlist.clear()
+        board.critiques.clear()
+        board.objections.clear()
+        board.evidence.clear()
+        board.scores.clear()
+        board.signoffs.clear()
+        board.proposal = None
+        board.review_snapshot_hash = None
+        board.proposal_review_issues.clear()
+        board.outcome = board.stop_reason = None
+        return self.commit(state, "reopen_discussion", board, branches=Overwrite([]), revise=False)
+
+    def requirements_spec(self, state: GraphState) -> GraphState:
+        board = self.load(state, "requirements_spec")
+        board.outcome = None
+        engineering = board.engineering
+        engineering.requirements = self.model.run(
+            "requirements_spec", "user",
+            {"想法": board.idea, "选定方案": board.proposal.model_dump(),
+             "尚未解决的评审条件": board.proposal_review_issues,
+             "修改意见": engineering.feedback},
+            DesignSpecification, validate_spec,
+        )
+        engineering.requirements_approval = None
+        return self.commit(state, "requirements_spec", board, halt=False, revise=False)
+
+    def confirm_engineering(self, state: GraphState, kind: str, document) -> GraphState:
+        board = self.load(state, kind)
+        engineering = board.engineering
+        expected = fingerprint(document)
+        risk = kind == "design_confirm" and engineering.design_review_pending
+        answer = self.ask(state, kind, expected[:12], {
+            "snapshot": expected, "document": document.model_dump(), "needs_risk_ack": risk,
+            "approval_blocked": False,
+        })
+        if answer["value"] == {"stop": True}:
+            return self.user_stop(state, kind, board, answer)
+        self.log_decision(board, kind, answer)
+        approved = answer["value"]["approve"]
+        field = {"requirements_confirm": "requirements_approval",
+                 "design_confirm": "design_approval"}[kind]
+        setattr(engineering, field, expected if approved else None)
+        if not approved:
+            engineering.feedback.append(answer["value"]["feedback"])
+        return self.commit(state, kind, board, halt=False, revise=not approved)
+
+    def requirements_confirm(self, state: GraphState) -> GraphState:
+        board = self.store.board(state["run_id"], state["revision"])
+        return self.confirm_engineering(state, "requirements_confirm", board.engineering.requirements)
+
+    def engineering_design(self, state: GraphState) -> GraphState:
+        board = self.load(state, "engineering_design")
+        engineering = board.engineering
+        baseline = engineering.requirements
+
+        def check(spec):
+            validate_spec(spec)
+            if baseline and spec.requirements != baseline.requirements:
+                raise ValueError("设计规格必须保留已确认需求，不能改写需求基线。")
+
+        engineering.design = self.model.run(
+            "engineering_design", "tech",
+            {"输入设计规格": engineering.source_text or board.technical_report.sections,
+             "已确认需求": baseline.model_dump() if baseline else None,
+             "修改意见": engineering.feedback},
+            DesignSpecification, check,
+        )
+        engineering.design_approval = None
+        return self.commit(state, "engineering_design", board, halt=False, revise=False)
+
+    def design_confirm(self, state: GraphState) -> GraphState:
+        board = self.store.board(state["run_id"], state["revision"])
+        return self.confirm_engineering(state, "design_confirm", board.engineering.design)
+
+    def task_decompose(self, state: GraphState) -> GraphState:
+        board = self.load(state, "task_decompose")
+        engineering = board.engineering
+        if engineering.design_approval != fingerprint(engineering.design):
+            raise ValueError("当前设计规格尚未确认。")
+        engineering.plan = self.model.run(
+            "task_decompose", "pm",
+            {"设计规格": engineering.design.model_dump(),
+             "需求到模块的映射": {
+                 req.id: [module.id for module in engineering.design.modules
+                          if req.id in module.requirement_ids]
+                 for req in engineering.design.requirements
+             },
+             "上一版任务索引": [
+                 {"id": task.id, "title": task.title, "depends_on": task.depends_on}
+                 for task in engineering.plan.tasks
+             ] if engineering.plan else [],
+             "上一版评审意见": engineering.plan_review.model_dump() if engineering.plan_review else {},
+             "最大并行任务数": engineering.max_parallel,
+             "修改意见": [
+                 item.value["feedback"] for item in board.decisions
+                 if item.kind == "plan_confirm" and item.value.get("feedback")
+             ]},
+            DevelopmentPlan, lambda plan: validate_plan(plan, engineering.design),
+        )
+        engineering.plan_approval = None
+        engineering.plan_review = None
+        engineering.schedule_rows = []
+        board.stop_reason = None
+        return self.commit(state, "task_decompose", board, halt=False, revise=False, plan_action="")
+
+    def plan_review(self, state: GraphState) -> GraphState:
+        board = self.load(state, "plan_review")
+        engineering = board.engineering
+        ids = {t.id for t in engineering.plan.tasks}
+
+        def check(review):
+            if any(f.task_id is not None and f.task_id not in ids for f in review.findings):
+                raise ValueError("评审必须引用实际任务编号。")
+
+        engineering.plan_review = self.model.run(
+            "plan_review", "devil",
+            {"设计规格": engineering.design.model_dump(), "任务计划": engineering.plan.model_dump()},
+            PlanReview, check,
+        )
+        major = any(f.severity == "major" for f in engineering.plan_review.findings)
+        manual = state.get("plan_action") == "review"
+        revise = major and not manual and engineering.plan_revisions < 2
+        if revise:
+            engineering.plan_revisions += 1
+        approved = manual and not major
+        if approved:
+            engineering.plan_approval = fingerprint(engineering.plan)
+        return self.commit(state, "plan_review", board, halt=False, revise=revise,
+                           plan_action="approved" if approved else "")
+
+    def plan_confirm(self, state: GraphState) -> GraphState:
+        board = self.load(state, "plan_confirm")
+        engineering = board.engineering
+        plan = engineering.plan
+        expected = fingerprint(plan)
+        review = engineering.plan_review
+        answer = self.ask(state, "plan_confirm", expected[:12], {
+            "snapshot": expected, "document": plan.model_dump(), "needs_risk_ack": False,
+            "approval_blocked": bool(review and any(f.severity == "major" for f in review.findings)),
+            "review_required": review is None,
+        })
+        value = answer["value"]
+        if value == {"stop": True}:
+            return self.user_stop(state, "plan_confirm", board, answer)
+        self.log_decision(board, "plan_confirm", answer)
+        if value.get("action") == "edit_plan":
+            edit = PlanEdit.model_validate(value["edit"])
+            engineering.plan = edited_plan(plan, edit)
+            engineering.max_parallel = edit.max_parallel
+            engineering.plan_approval = None
+            if engineering.plan != plan:
+                engineering.plan_review = None
+            engineering.schedule_rows = [
+                ScheduledTask.model_validate(row)
+                for row in schedule(engineering.plan, engineering.max_parallel)
+            ]
+            return self.commit(state, "plan_confirm", board, halt=False, revise=False,
+                               plan_action="saved")
+        if not value["approve"]:
+            engineering.plan_approval = None
+            engineering.feedback.append(value["feedback"])
+            engineering.plan_revisions = 0
+            return self.commit(state, "plan_confirm", board, halt=False, revise=True, plan_action="")
+        if review is not None:
+            engineering.plan_approval = expected
+        return self.commit(state, "plan_confirm", board, halt=False, revise=False,
+                           plan_action="review" if review is None else "approved")
+
+    def orchestrate(self, state: GraphState) -> GraphState:
+        board = self.load(state, "orchestrate")
+        engineering = board.engineering
+        if engineering.plan_approval != fingerprint(engineering.plan):
+            raise ValueError("当前任务计划尚未确认。")
+        engineering.tasks = {task.id: TaskProgress() for task in engineering.plan.tasks}
+        engineering.schedule_rows = [
+            ScheduledTask.model_validate(row)
+            for row in schedule(engineering.plan, engineering.max_parallel)
+        ]
+        refresh_ready(engineering)
+        board.outcome, board.stop_reason = (
+            "completed", "任务分解与执行编排已生成。请在任务看板启动工作并逐项验收。",
+        )
+        return self.commit(state, "orchestrate", board, halt=False, revise=False)
 
     def load(self, state: GraphState, phase: str) -> Blackboard:
         self.store.check_cancel(state["run_id"])
@@ -241,6 +540,9 @@ class Workshop:
             if needs_review
             else "技术报告已生成。默认设计和待验证事项已标注。"
         )
+        if board.engineering:
+            board.engineering.design_review_pending = needs_review
+            board.outcome = None
         return self.commit(state, "technical_report", board)
 
     def project_probe(self, state: GraphState) -> GraphState:
@@ -327,7 +629,10 @@ class Workshop:
 
     @staticmethod
     def divergence_input(board: Blackboard) -> dict:
-        return {"idea": board.idea, "frame": board.frame.model_dump()}
+        payload = {"idea": board.idea, "frame": board.frame.model_dump()}
+        if board.engineering and board.engineering.feedback:
+            payload["feedback"] = board.engineering.feedback
+        return payload
 
     def divergence_node(self, role: Role):
         def run(state: GraphState) -> GraphState:
@@ -350,7 +655,7 @@ class Workshop:
 
     def shortlist(self, state: GraphState) -> GraphState:
         board = self.load(state, "shortlist")
-        if len(board.options) <= 3:
+        if self.model.config.internal_deliberation or len(board.options) <= 3:
             board.shortlist = [item.id for item in board.options]
         else:
             answer = self.ask(
@@ -367,26 +672,60 @@ class Workshop:
 
     def critique(self, state: GraphState) -> GraphState:
         board = self.load(state, "critique")
-        payload = rules.critique_input(board)
-        saved = saved_critiques(self.store, state["run_id"], payload)
+        options = rules.shortlisted(board)
+        saved = saved_critiques(self.store, state["run_id"], rules.critique_input(board))
+        batch_size = 3
+        payloads = [
+            rules.critique_input(board, options[offset:offset + batch_size])
+            for offset in range(0, len(options), batch_size)
+        ]
 
         def review(role: Role) -> Critique:
             if role in saved:
                 return saved[role]
-            return self.model.run(
-                "critique",
-                role,
-                rules.critique_targets(payload, role),
-                Critique,
-                lambda reply: rules.validate_critique(role, payload, reply),
+            batches = [
+                self.model.run(
+                    "critique", role, rules.critique_targets(payload, role), CritiqueBatch,
+                    lambda reply, batch=payload: rules.validate_critique(
+                        role, batch, reply, allow_missing_checks=True
+                    ),
+                )
+                for payload in payloads
+            ]
+            return Critique(
+                reviews=[item for batch in batches for item in batch.reviews],
+                objections=[item for batch in batches for item in batch.objections],
+                checked_assumptions=[item for batch in batches for item in batch.checked_assumptions],
             )
 
         board.critiques = self.parallel(review)
-        rules.record_objections(board)
+        critic = board.critiques["devil"]
+        checked = set(critic.checked_assumptions)
+        checked.update(o.assumption_id for o in critic.objections if o.kind == "factual")
+        assumption_reviews = {}
+        for option in options:
+            for assumption in option.assumptions:
+                if assumption.critical and assumption.id not in checked:
+                    assumption_reviews[assumption.id] = self.model.run(
+                        "critique_assumption", "devil",
+                        {"goal": board.frame.goal, "constraints": board.frame.constraints,
+                         "option": {"title": option.title, "approach": option.approach},
+                         "assumption": assumption.model_dump(include={
+                             "id", "statement", "verification_plan",
+                         })},
+                        AssumptionReview,
+                    )
+        critic.checked_assumptions = [
+            a.id for option in options for a in option.assumptions if a.critical
+        ]
+        rules.record_objections(board, assumption_reviews)
         return self.commit(state, "critique", board)
 
     def resolve(self, state: GraphState) -> GraphState:
         board = self.load(state, "resolve")
+        if self.model.config.internal_deliberation:
+            self.resolve_internally(board)
+            return self.commit(state, "resolve", board)
         for issue in board.objections:
             needs_answer = issue.status == "needs_human" or (
                 issue.status == "needs_evidence"
@@ -430,30 +769,93 @@ class Workshop:
                         assumption.evidence_ids.append(evidence.id)
         return self.commit(state, "resolve", board)
 
+    def resolve_internally(self, board: Blackboard) -> None:
+        issues = {issue.id: issue for issue in board.objections if issue.kind != "factual"}
+        if not issues:
+            return
+
+        def check(result: TradeoffDecisions) -> None:
+            ids = [item.issue_id for item in result.decisions]
+            if len(ids) != len(set(ids)) or set(ids) - issues.keys():
+                raise ValueError("取舍决定必须引用一条有效且不重复的非事实异议。")
+
+        result = self.model.run(
+            "internal_resolution", "pm",
+            {**rules.critique_input(board),
+             "cross_reviews": {role: item.model_dump() for role, item in board.critiques.items()},
+             "issues": [item.model_dump() for item in issues.values()]},
+            TradeoffDecisions, check,
+        )
+        for item in result.decisions:
+            decision = self.log_decision(board, "resolve", {
+                "value": {"issue_id": item.issue_id, "choice": item.choice},
+                "reason": item.rationale, "actor": "agent", "answered_at": time.time(),
+            })
+            issue = issues[item.issue_id]
+            issue.status, issue.decision_id = "resolved", decision.id
+        for issue in issues.values():
+            if not issue.decision_id:
+                issue.status = "retained"
+
     def score(self, state: GraphState) -> GraphState:
         board = self.load(state, "score")
-        payload = {
-            "idea": board.idea,
-            "frame": board.frame.model_dump(),
-            "options": [item.model_dump() for item in rules.shortlisted(board)],
-            "objections": [item.model_dump() for item in board.objections],
-            "decisions": [item.model_dump() for item in board.decisions],
-            "evidence": [item.model_dump() for item in board.evidence],
-            "rubric": rules.scoring_rubric(self.model.config.weights),
-        }
-        board.scores = self.parallel(
-            lambda role: self.model.run(
-                "score",
-                role,
-                payload,
-                Scorecard,
-                lambda reply: rules.validate_score(board, reply),
-            )
-        )
+        options = rules.shortlisted(board)
+        batch_size = 3
+
+        def assess(role: Role) -> Scorecard:
+            assessments = []
+            for offset in range(0, len(options), batch_size):
+                batch = options[offset:offset + batch_size]
+                option_ids = [item.id for item in batch]
+                objections = [o for o in board.objections if o.option_id in option_ids]
+                decision_ids = {o.decision_id for o in objections}
+                # Legacy resolve decisions record evidence indirectly through objections.
+                evidence_ids = {o.evidence_id for o in objections} | {
+                    ref for option in batch for a in option.assumptions for ref in a.evidence_ids
+                }
+                payload = {
+                    "idea": board.idea,
+                    "frame": board.frame.model_dump(),
+                    "options": [item.model_dump() for item in batch],
+                    "allowed_conditions": {
+                        ref: rules.condition_status(board, ref) for ref in option_ids
+                    },
+                    "objections": [item.model_dump() for item in objections],
+                    "decisions": [
+                        item.model_dump() for item in board.decisions if item.id in decision_ids
+                    ],
+                    "evidence": [
+                        item.model_dump() for item in board.evidence if item.id in evidence_ids
+                    ],
+                    "rubric": rules.scoring_rubric(self.model.config.weights),
+                }
+                result = self.model.run(
+                    "score", role, payload, Scorecard,
+                    lambda reply, ids=option_ids: rules.validate_score(board, reply, ids),
+                )
+                assessments.extend(result.assessments)
+            return Scorecard(assessments=assessments)
+
+        board.scores = self.parallel(assess)
         return self.commit(state, "score", board)
 
     def select(self, state: GraphState) -> GraphState:
         board = self.load(state, "select")
+        if self.model.config.internal_deliberation:
+            ranked = rules.rankings(board, self.model.config.weights)
+            selected = min(ranked, key=lambda row: (
+                bool(rules.blocking_ids(board, row["option_id"])),
+                row["score"] is None or row["consensus"] < 0.75,
+                -(row["score"] or 0), -row["consensus"], row["option_id"],
+            ))
+            score = selected["score"] if selected["score"] is not None else "资料不足"
+            self.log_decision(board, "select", {
+                "value": {"option_id": selected["option_id"]},
+                "reason": (f"优先推荐无重大阻塞且达到评分和支持门槛的方案，"
+                           f"综合评分 {score}，有效支持 {selected['consensus']:.0%}。"),
+                "actor": "orchestrator", "answered_at": time.time(),
+            })
+            return self.commit(state, "select", board)
         answer = self.ask(
             state,
             "select",
@@ -494,6 +896,12 @@ class Workshop:
                 item.model_dump() for item in board.objections if item.option_id == option_id
             ],
         }
+        if self.model.config.internal_deliberation:
+            payload["tradeoff_decisions"] = [
+                item.model_dump() for item in board.decisions
+                if item.id in {issue.decision_id for issue in board.objections
+                               if issue.option_id == option_id}
+            ]
         board.signoffs = self.parallel(
             lambda role: self.model.run(
                 "signoff",
@@ -520,6 +928,10 @@ class Workshop:
             if proposal.revision < self.model.config.max_draft_revisions:
                 return self.commit(state, "signoff", board, revise=True)
             reasons.append("未获得四位专家对当前版本的有效签署")
+        if self.model.config.internal_deliberation:
+            board.proposal_review_issues = reasons
+            board.outcome = board.stop_reason = None
+            return self.commit(state, "signoff", board, revise=False)
         board.outcome = "partial" if reasons else "completed"
         board.stop_reason = "；".join(reasons) if reasons else "选定方向通过共识与版本签署门槛。"
         return self.commit(state, "signoff", board, revise=False)

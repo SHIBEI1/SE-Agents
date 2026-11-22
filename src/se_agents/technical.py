@@ -65,7 +65,7 @@ class Requirement(Record):
 class Scope(Chapters):
     directory: ClassVar[dict[str, str]] = SCOPE
     assumptions: list[Assumption] = Field(min_length=1, max_length=10)
-    requirements: list[Requirement] = Field(min_length=5, max_length=14)
+    requirements: list[Requirement] = Field(min_length=1, max_length=32)
 
 
 class TestCase(Record):
@@ -126,7 +126,7 @@ def validate_delivery(part: Delivery, requirements: list[Requirement]) -> None:
 
 
 def context(board: Blackboard) -> dict:
-    return {
+    result = {
         "用户原始想法": board.idea,
         "用户提供的补充背景": (
             board.frame_hints.model_dump(exclude_none=True) if board.frame_hints else {}
@@ -138,12 +138,24 @@ def context(board: Blackboard) -> dict:
             item.value["reply"] for item in board.decisions if item.kind == "design_clarify"
         ],
     }
+    if board.proposal:
+        result["已评审选定的建设方案"] = board.proposal.model_dump()
+    if board.engineering and board.engineering.requirements:
+        result["已确认需求规格"] = board.engineering.requirements.model_dump()
+    return result
 
 
 def build_report(model: ModelRunner, board: Blackboard) -> tuple[TechnicalReport, bool]:
     source = context(board)
     model.store.set_stage(model.run_id, "report_scope")
-    scope = model.run("report_scope", "pm", {"输入": source, "目录": SCOPE}, Scope, validate_scope)
+    def check_scope(part):
+        validate_scope(part)
+        if board.engineering and board.engineering.requirements:
+            baseline = board.engineering.requirements.requirements
+            expected = {item.id for item in baseline}
+            if {item.id for item in part.requirements} != expected:
+                raise ValueError("报告需求编号必须与已确认的需求基线一致。")
+    scope = model.run("report_scope", "pm", {"输入": source, "目录": SCOPE}, Scope, check_scope)
     model.store.set_stage(model.run_id, "report_architecture")
     architecture = {}
     for title, instruction in ARCHITECTURE.items():

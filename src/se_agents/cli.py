@@ -74,6 +74,8 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("start", help="读取软件想法并使用真实模型生成技术报告")
     start.add_argument("file", type=Path)
+    start.add_argument("--workflow", choices=["full", "planning", "legacy"], default="full")
+    start.add_argument("--max-parallel", type=int, choices=range(1, 5), default=2)
     for name in ("show", "resume", "cancel"):
         commands.add_parser(name).add_argument("run_id")
     answer = commands.add_parser("answer")
@@ -89,7 +91,12 @@ def main() -> None:
     service = Service(args.data_dir)
     try:
         if args.command == "start":
-            run_id = service.create(read_idea(args.file), configured_model())
+            config = configured_model().model_copy(update={
+                "workflow_mode": args.workflow, "max_parallel_tasks": args.max_parallel,
+                "chat_mode": args.workflow == "full", "max_calls": 100, "max_tokens": 800_000,
+                "max_output_tokens": 8192,
+            })
+            run_id = service.create(read_idea(args.file), config)
             service.execute(run_id)
         else:
             run_id = args.run_id

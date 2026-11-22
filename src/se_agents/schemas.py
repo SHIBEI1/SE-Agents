@@ -7,6 +7,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .planning import Engineering
+
 Role = Literal["pm", "user", "tech", "devil"]
 ROLES: tuple[Role, ...] = ("pm", "user", "tech", "devil")
 ROLE_NAMES = {"pm": "产品经理", "user": "用户研究员", "tech": "技术架构师", "devil": "质疑者"}
@@ -41,6 +43,9 @@ class RunConfig(Record):
     mode: Literal["mock", "deepseek", "api"] = "mock"
     chat_mode: bool = False
     technical_mode: bool = False
+    workflow_mode: Literal["legacy", "full", "planning"] = "legacy"
+    internal_deliberation: bool = False
+    max_parallel_tasks: int = Field(default=2, ge=1, le=4)
     model: ShortText = "deepseek-flash"
     base_url: str | None = None
     max_calls: int = Field(default=48, ge=1, le=100)
@@ -138,9 +143,19 @@ class Objection(ObjectionSeed):
 
 
 class Critique(Record):
+    reviews: list[Review] = Field(max_length=64)
+    objections: list[ObjectionSeed] = Field(max_length=64)
+    checked_assumptions: list[str] = Field(default_factory=list, max_length=36)
+
+
+class CritiqueBatch(Critique):
     reviews: list[Review] = Field(max_length=16)
-    objections: list[ObjectionSeed] = Field(max_length=8)
-    checked_assumptions: list[str] = Field(max_length=36)
+    objections: list[ObjectionSeed] = Field(max_length=16)
+
+
+class AssumptionReview(Record):
+    reason: Text
+    action: Text
 
 
 class Scores(Record):
@@ -151,17 +166,35 @@ class Scores(Record):
     risk: Grade | None
 
 
+class ScoreReasons(Record):
+    value: Text
+    feasibility: Text
+    cost: Text
+    fit: Text
+    risk: Text
+
+
 class Assessment(Record):
     option_id: str
     scores: Scores
-    reasons: dict[str, Text]
+    reasons: ScoreReasons
     stance: Literal["support", "conditional", "oppose", "abstain"]
     rationale: Text
     condition_ids: list[str] = Field(default_factory=list)
 
 
 class Scorecard(Record):
-    assessments: list[Assessment] = Field(min_length=1, max_length=3)
+    assessments: list[Assessment] = Field(min_length=1, max_length=12)
+
+
+class Tradeoff(Record):
+    issue_id: ShortText
+    choice: Text
+    rationale: Text
+
+
+class TradeoffDecisions(Record):
+    decisions: list[Tradeoff] = Field(max_length=32)
 
 
 class Signoff(Record):
@@ -180,10 +213,11 @@ class Decision(Record):
     kind: Literal[
         "frame", "shortlist", "resolve", "select", "stop", "design_clarify",
         "project_clarify", "project_review_clarify",
+        "proposal_confirm", "requirements_confirm", "design_confirm", "plan_confirm",
     ]
     value: dict
     reason: Text
-    actor: Literal["human", "demo"]
+    actor: Literal["human", "demo", "agent", "orchestrator"]
     answered_at: float
 
 
@@ -254,6 +288,7 @@ class Blackboard(Record):
     scores: dict[Role, Scorecard] = Field(default_factory=dict)
     decisions: list[Decision] = Field(default_factory=list)
     proposal: Proposal | None = None
+    proposal_review_issues: list[str] = Field(default_factory=list)
     design_questions: list[DesignQuestion] = Field(default_factory=list)
     technical_report: TechnicalReport | None = None
     project_build: ProjectBuild | None = None
@@ -263,3 +298,4 @@ class Blackboard(Record):
     review_snapshot_hash: str | None = None
     outcome: Literal["completed", "partial"] | None = None
     stop_reason: str | None = None
+    engineering: Engineering | None = None

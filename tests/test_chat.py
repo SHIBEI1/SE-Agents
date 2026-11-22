@@ -68,7 +68,7 @@ def test_review_recovers_two_candidates_from_same_author(tmp_path, monkeypatch):
         targets = payload["review_target_ids"]
         assert len(targets) == (0 if role == "pm" else 1)
         if role == "pm" and fail_pm:
-            return {"reviews": [], "objections": []}
+            return {"objections": []}
         result = mock_reply(phase, role, payload)
         assert [item["claim_id"] for item in result["reviews"]] == targets
         return result
@@ -86,7 +86,7 @@ def test_review_recovers_two_candidates_from_same_author(tmp_path, monkeypatch):
     assert set(saved) == {"user", "tech", "devil"}
     assert saved["user"].objections
     assert any(
-        "checked_assumptions" in (row["diagnostic"] or "") for row in service.store.call_log(run_id)
+        "reviews" in (row["diagnostic"] or "") for row in service.store.call_log(run_id)
     )
 
     fail_pm = False

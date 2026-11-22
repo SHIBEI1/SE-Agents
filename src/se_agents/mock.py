@@ -86,6 +86,19 @@ def mock_reply(task: str, role: str, payload: dict) -> dict:
             "checked_assumptions": payload["critical_ids"] if role == "devil" else [],
         }
 
+    if task == "critique_assumption":
+        return {
+            "reason": f"尚缺少验证「{payload['assumption']['statement']}」的实测或用户反馈。",
+            "action": payload["assumption"]["verification_plan"],
+        }
+
+    if task == "internal_resolution":
+        return {"decisions": [
+            {"issue_id": issue["id"], "choice": "优先验证核心场景",
+             "rationale": "根据当前原型目标控制实施范围。"}
+            for issue in payload["issues"]
+        ]}
+
     if task == "score":
         assessments = []
         for option in payload["options"]:

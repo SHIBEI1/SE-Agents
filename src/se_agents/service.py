@@ -14,6 +14,7 @@ from langgraph.types import Command
 from .chat import chat_answer, question_text, structured_reply
 from .human import validate_answer
 from .models import ModelError, ModelRunner, configured_model
+from .planning import Engineering
 from .project import project_destination
 from .schemas import Blackboard, Frame, FrameNotes, ProjectBuild, RunConfig, digest
 from .storage import BudgetLimit, Cancelled, Store
@@ -74,13 +75,23 @@ class Service:
         frame_hints: FrameNotes | None = None,
     ) -> str:
         idea = idea.strip()
-        if not 1 <= len(idea) <= 10_000:
-            raise ValueError("软件想法须为 1 到 10,000 个字符。")
+        limit = 60_000 if config.workflow_mode == "planning" else 10_000
+        if not 1 <= len(idea) <= limit:
+            raise ValueError(f"输入须为 1 到 {limit:,} 个字符。")
         if config.mode != "mock":
             runner = ModelRunner(self.store, "preflight", config)
             runner.close()
+        engineering = None
+        if config.workflow_mode != "legacy":
+            if config.workflow_mode == "full":
+                config = config.model_copy(update={"internal_deliberation": True})
+            engineering = Engineering(
+                source_text=idea if config.workflow_mode == "planning" else "",
+                max_parallel=config.max_parallel_tasks,
+            )
         return self.store.create(
-            Blackboard(idea=idea, frame=frame, frame_hints=frame_hints), config, name
+            Blackboard(idea=idea, frame=frame, frame_hints=frame_hints, engineering=engineering),
+            config, name,
         )
 
     def create_build(
@@ -118,6 +129,22 @@ class Service:
         board.stop_reason = None
         return self.store.create(board, config, f"{source['name'][:50]}－项目构建")
 
+    def create_planning(self, source_id: str, revision: int) -> str:
+        source = self.store.run(source_id)
+        if source["revision"] != revision:
+            raise ValueError("报告版本已更新，请刷新后重新选择。")
+        board = self.store.board(source_id, revision)
+        if not board.technical_report:
+            raise ValueError("请先生成技术报告。")
+        text = "\n\n".join(
+            f"## {title}\n{body}" for title, body in board.technical_report.sections.items()
+        )
+        config = configured_model().model_copy(update={
+            "workflow_mode": "planning", "max_calls": 100, "max_tokens": 800_000,
+            "max_output_tokens": 8192,
+        })
+        return self.create(text, config, name=f"{source['name'][:45]}－任务编排")
+
     def delete_run(self, run_id: str) -> None:
         with self.worker_lock():
             self.store.recover_abandoned()
@@ -144,7 +171,7 @@ class Service:
         return {
             "configurable": {"thread_id": run_id},
             "max_concurrency": config.concurrency,
-            "recursion_limit": 40,
+            "recursion_limit": 80,
         }
 
     @staticmethod

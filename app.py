@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 
 from se_agents import deliberation as rules
 from se_agents.chat import question_text
-from se_agents.human import DEVELOPMENT_QUESTIONS
+from se_agents.engineering_ui import render_engineering
+from se_agents.human import APPROVAL_QUESTIONS, DEVELOPMENT_QUESTIONS
 from se_agents.models import configured_model
 from se_agents.presentation import (
     CALL_STATUS,
@@ -30,6 +31,7 @@ from se_agents.presentation import (
 from se_agents.reporting import export_json, export_markdown, technical_body
 from se_agents.schemas import DIMENSIONS, ROLE_NAMES
 from se_agents.service import Busy, Service
+from se_agents.task_execution import execute_task
 from se_agents.workflow import saved_critiques
 
 ROOT = Path(__file__).resolve().parent
@@ -73,6 +75,23 @@ def schedule(run_id: str, chat: tuple[str, str] | None = None) -> None:
     st.session_state.active_task = run_id
     st.session_state.pending_chat = chat
     st.session_state.work = pool.submit(service.execute, run_id, chat=chat)
+    st.rerun()
+
+
+def schedule_task(run_id: str, revision: int, task_id: str) -> None:
+    st.session_state.next_task = run_id
+    st.session_state.active_task = run_id
+    st.session_state.pending_chat = None
+    st.session_state.work = pool.submit(execute_task, service, run_id, revision, task_id)
+    st.rerun()
+
+
+def schedule_approval(run_id: str, request: dict, value: dict, reason: str) -> None:
+    st.session_state.next_task = run_id
+    st.session_state.active_task = run_id
+    st.session_state.pending_chat = None
+    answer = {"request_id": request["id"], "value": value, "reason": reason}
+    st.session_state.work = pool.submit(service.execute, run_id, answer)
     st.rerun()
 
 
@@ -120,6 +139,7 @@ def running(run_id: str) -> None:
     if (future is not None and future.done()) or (future is None and run["status"] != "running"):
         st.rerun()
     activity_panel(run, live=True)
+    render_engineering(service, run_id, service.store.board(run_id), schedule_task, live=True)
     if st.button("停止任务", key=f"cancel-{run_id}"):
         service.store.request_cancel(run_id)
         st.rerun()
@@ -172,45 +192,65 @@ def message(kind: str, text: str) -> None:
         st.markdown(text)
 
 
-def read_idea(submission) -> str:
-    if isinstance(submission, str):
-        return submission
-    idea = submission.text or ""
-    if submission.files:
-        upload = submission.files[0]
-        if upload.size > 1_048_576:
-            raise ValueError("文件超过 1 兆字节。")
-        try:
-            content = upload.getvalue().decode("utf-8-sig")
-        except UnicodeError as exc:
-            raise ValueError("无法读取文件，请把内容粘贴到聊天框。") from exc
-        idea = "\n\n".join(part for part in (idea.strip(), content.strip()) if part)
-    return idea
+def read_idea(idea, upload=None) -> str:
+    if upload is None:
+        return idea
+    if upload.size > 1_048_576:
+        raise ValueError("文件超过 1 兆字节。")
+    try:
+        content = upload.getvalue().decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise ValueError("无法读取文件，请将内容粘贴到输入框。") from exc
+    return "\n\n".join(part for part in (idea.strip(), content.strip()) if part)
 
 
 def new_chat(name: str) -> None:
-    st.title("你想开发什么？")
-    st.write("描述你的想法，或附上需求文档。确认方案后，工作台会构建项目并提供验收结果。")
+    st.title("软件工程工作流")
+    choices = {"完整流程：从想法到任务编排": "full",
+               "课堂作业二：设计规格到任务编排": "planning",
+               "技术报告与项目构建": "legacy"}
+    mode = choices[st.selectbox("选择起点", list(choices), key="workflow-choice")]
+    parallel = st.number_input("最大并行任务数", min_value=1, max_value=4, value=2, step=1)
+    if mode == "planning":
+        st.write("上传已有设计规格，确认模块与需求后，由 PM Agent 拆分任务。可编辑依赖并重排甘特图。")
+    elif mode == "full":
+        st.write("Agent 独立构思、比较并复核候选，汇总一个推荐方案供你确认。")
+    else:
+        st.write("输入想法生成技术报告，经确认后可构建项目。")
     config = None
     try:
         config = configured_model()
+        config = config.model_copy(update={
+            "workflow_mode": mode, "max_parallel_tasks": int(parallel),
+            "chat_mode": mode == "full", "max_calls": 100,
+            "max_tokens": 800_000, "max_output_tokens": 8192,
+        })
     except ValueError as exc:
         st.warning(str(exc))
     if config:
         st.caption(f"当前模型为 {config.model}。发送后将调用模型。")
-    submission = st.chat_input(
-        "输入软件想法，按回车发送",
-        key="new_idea",
-        max_chars=10000,
-        accept_file=True,
-        file_type=["txt", "md"],
-        max_upload_size=1,
-        disabled=config is None,
-    )
-    if not submission:
-        return
+    if mode == "planning":
+        with st.form("import-design-spec"):
+            upload = st.file_uploader("选择设计规格文件", type=["md", "txt"], max_upload_size=1)
+            idea = st.text_area("或粘贴设计规格", max_chars=60_000, height=150)
+            submitted = st.form_submit_button("导入设计规格", type="primary", disabled=config is None)
+        if not submitted:
+            return
+    else:
+        submission = st.chat_input(
+            "输入软件想法，按回车发送", key="new_idea", max_chars=10000,
+            accept_file=True, file_type=["txt", "md"], max_upload_size=1,
+            disabled=config is None,
+        )
+        if not submission:
+            return
+        if isinstance(submission, str):
+            idea, upload = submission, None
+        else:
+            idea = submission.text or ""
+            upload = submission.files[0] if submission.files else None
     try:
-        schedule(service.create(read_idea(submission), config, name=name))
+        schedule(service.create(read_idea(idea, upload), config, name=name))
     except ValueError as exc:
         st.error(zh(str(exc)))
 
@@ -376,18 +416,83 @@ if active or run["status"] == "running":
             running(run_id)
     st.stop()
 
-if not config.technical_mode and st.button("用原始想法生成技术报告", type="primary"):
+if board.engineering is None and not config.technical_mode and st.button(
+    "用原始想法生成技术报告", type="primary"
+):
     try:
         schedule(service.create(board.idea, configured_model(), name=run["name"]))
     except ValueError as exc:
         st.error(zh(str(exc)))
 
-if config.mode != "mock" and (request := service.request(run_id)):
+plan_failed = bool(
+    board.engineering and run["status"] == "failed"
+    and run["stage"] in {"task_decompose", "plan_review"}
+)
+if plan_failed:
+    st.error(zh(run["error"] or "任务计划生成或评审失败。"))
+    if st.button("继续任务", key=f"resume-plan-{run_id}"):
+        schedule(run_id)
+
+request = service.request(run_id) if config.mode != "mock" else None
+approval_slot = render_engineering(service, run_id, board, schedule_task, request=request)
+
+if request:
     if not any(
         row["kind"] == "question" and row["request_id"] == request["id"] for row in transcript
     ):
         with thread:
             message("assistant", question_text(request))
+    if request["kind"] in APPROVAL_QUESTIONS:
+        proposal_question = request["kind"] == "proposal_confirm"
+        if proposal_question:
+            option = next(item for item in board.options if item.id == board.proposal.option_id)
+            st.subheader("推荐建设方案")
+            st.markdown(f"**{option.title}**")
+            if board.proposal_review_issues:
+                st.warning("这份推荐方案还有待处理的评审条件。")
+                for issue in board.proposal_review_issues:
+                    st.write(zh(issue))
+            for title, content in board.proposal.sections.items():
+                with st.expander(title, expanded=title in {
+                    "范围与非目标", "核心功能", "决策依据", "未决问题与分歧",
+                }):
+                    st.markdown(zh(content))
+            with st.expander("各角色的复核结论"):
+                for role, signoff in board.signoffs.items():
+                    st.write(f"{ROLE_NAMES[role]} · {SIGNOFF[signoff.verdict]} · {zh(signoff.reason)}")
+        confirmation_labels = {
+            "proposal_confirm": "采纳方案并整理需求",
+            "design_confirm": "确认设计规格并拆任务",
+            "plan_confirm": (
+                "复核并确认任务计划" if request["payload"].get("review_required") else "确认任务计划"
+            ),
+        }
+        with (approval_slot or st.container()), st.form(f"approval-{request['id']}"):
+            feedback = st.text_area("修改意见，退回时必填", max_chars=2400)
+            risk_ack = st.checkbox("我已查看遗留问题与风险") if (
+                request["payload"].get("needs_risk_ack")
+            ) else False
+            confirm, reject = st.columns(2)
+            approved = confirm.form_submit_button(
+                confirmation_labels.get(request["kind"], "确认当前版本并继续"),
+                type="primary",
+                disabled=bool(request["payload"].get("approval_blocked")),
+            )
+            rejected = reject.form_submit_button("退回重新论证" if proposal_question else "退回修改")
+        if approved or rejected:
+            if rejected and not feedback.strip():
+                st.error("请填写修改意见。")
+            elif approved and request["payload"].get("needs_risk_ack") and not risk_ack:
+                st.error("请先查看并确认遗留风险。")
+            else:
+                schedule_approval(run_id, request, {
+                    "approve": approved, "snapshot": request["payload"]["snapshot"],
+                    "feedback": feedback, "risk_ack": risk_ack,
+                }, feedback.strip() or "已审阅并确认当前版本")
+        activity_panel(run)
+        if board.options:
+            details(run_id, board, config, service.store.call_log(run_id))
+        st.stop()
     if request["kind"] in DEVELOPMENT_QUESTIONS:
         questions = request["payload"]["questions"]
         with thread:
@@ -404,11 +509,11 @@ if config.mode != "mock" and (request := service.request(run_id)):
         details(run_id, board, config, service.store.call_log(run_id))
     st.stop()
 
-if board.stop_reason or run["error"]:
+if not plan_failed and (board.stop_reason or run["error"]):
     with thread:
-        message("assistant", zh(board.stop_reason or run["error"]))
+        message("assistant", zh(run["error"] or board.stop_reason))
 if (
-    config.mode != "mock"
+    not plan_failed and config.mode != "mock"
     and run["status"] in {"queued", "interrupted", "failed"}
     and st.button("继续任务")
 ):
@@ -466,7 +571,7 @@ if build := board.project_build:
                     st.download_button(
                         "下载此文件", content, file_name=path.name, mime="text/plain"
                     )
-elif board.technical_report:
+elif board.technical_report and board.engineering is None:
     with thread, st.chat_message("开发助手", avatar=":material/terminal:"):
         st.subheader("软件开发技术报告")
         title = "目标、角色与版本范围"
@@ -474,7 +579,12 @@ elif board.technical_report:
     with st.expander("查看完整技术报告"):
         for title, content in board.technical_report.sections.items():
             st.markdown(f"### {title}\n\n{technical_body(title, content)}")
-    if run["status"] in {"completed", "partial"}:
+    if board.engineering is None and st.button("按当前报告生成任务编排", type="primary"):
+        try:
+            schedule(service.create_planning(run_id, run["revision"]))
+        except (ValueError, Busy) as exc:
+            st.error(str(exc))
+    if board.engineering is None and run["status"] in {"completed", "partial"}:
         with st.expander("确认方案并构建项目"):
             if run["status"] == "partial":
                 st.warning("这版报告标为待复核草案。请先查看其中的待处理事项。")
@@ -523,7 +633,11 @@ if not board.project_build and (
 ):
     filename = re.sub(r'[\\/:*?"<>|]+', "－", run["name"])
     report, data = st.columns(2)
-    report_title = "技术报告" if board.technical_report else "论证摘要"
+    report_title = (
+        "任务编排" if board.engineering and board.engineering.plan
+        else "技术报告" if board.technical_report
+        else "设计规格" if board.engineering and board.engineering.design else "论证摘要"
+    )
     report.download_button(
         f"下载{report_title}",
         export_markdown(board, config, run, calls),
@@ -537,5 +651,7 @@ if not board.project_build and (
         file_name=f"{filename}－分析数据.json",
         mime="application/json",
     )
-if not board.project_build and (board.options or board.decisions or board.technical_report):
+if not board.project_build and (
+    board.options or (board.engineering is None and (board.decisions or board.technical_report))
+):
     details(run_id, board, config, calls)

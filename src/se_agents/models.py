@@ -73,6 +73,8 @@ def validation_detail(exc: ValueError) -> str:
         + (
             f"（最多 {error['ctx']['max_length']} 字符）"
             if error["type"] == "string_too_long"
+            else f"（最多 {error['ctx']['max_length']} 条）"
+            if error["type"] == "too_long" and "max_length" in error.get("ctx", {})
             else ""
         )
         for error in errors[:3]
@@ -119,11 +121,15 @@ class ModelRunner:
         task_prefix = f"{phase}:{role}:{input_hash[:20]}:"
         task = task_prefix + prompt_hash[:12]
         report_stage = phase.startswith("report_")
-        repairable_stage = report_stage or file_stage or phase in {"project_plan", "project_probe"}
+        repairable_stage = report_stage or file_stage or phase in {
+            "project_plan", "project_probe", "requirements_spec", "engineering_design",
+            "task_decompose", "plan_review", "task_execute", "task_review", "internal_resolution",
+            "critique", "critique_assumption", "score",
+        }
         cached = self.store.cached(self.run_id, task)
         if cached is not None:
             return schema.model_validate_json(cached)
-        if file_stage or (report_stage and self.resuming):
+        if file_stage or (self.resuming and (report_stage or phase == "critique")):
             for saved_task, saved in self.store.cached_phase(self.run_id, phase):
                 if saved_task.startswith(task_prefix):
                     try:
@@ -200,7 +206,16 @@ class ModelRunner:
                         raise ValueError("模型输出被截断")
                     if not raw:
                         raise ValueError("模型返回空响应")
-                result = schema.model_validate_json(raw)
+                try:
+                    result = schema.model_validate_json(raw)
+                except ValidationError as exc:
+                    # A stray annotation is harmless if every required scoring field is valid.
+                    if phase != "score" or any(
+                        error["type"] != "extra_forbidden"
+                        for error in exc.errors(include_input=False, include_url=False)
+                    ):
+                        raise
+                    result = schema.model_validate_json(raw, extra="ignore")
                 if validate:
                     validate(result)
             except (APIConnectionError, APIStatusError) as exc:

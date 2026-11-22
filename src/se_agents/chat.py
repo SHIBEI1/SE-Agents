@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from .human import DEVELOPMENT_QUESTIONS, validate_answer
+from .human import APPROVAL_QUESTIONS, DEVELOPMENT_QUESTIONS, validate_answer
 from .models import ModelError, ModelRunner
 from .presentation import EVIDENCE, zh
 from .schemas import FrameNotes
@@ -73,6 +73,14 @@ def frame_notes(text: str, model: ModelRunner) -> dict[str, str]:
 
 def question_text(request: dict) -> str:
     kind, payload = request["kind"], request["payload"]
+    if kind == "proposal_confirm":
+        return "Agent 已汇总一个推荐方案。请审阅后确认，或者填写意见退回重新论证。"
+    if kind == "plan_confirm" and payload.get("approval_blocked"):
+        return "计划还有重大评审问题。请查看评审意见，调整排期或填写意见退回 PM 重新拆分。"
+    if kind == "plan_confirm" and payload.get("review_required"):
+        return "已保存排期草案。确认时，质疑者会先复核这版计划。"
+    if kind in APPROVAL_QUESTIONS:
+        return "请审阅下方当前版本，确认后进入下一阶段，也可以填写修改意见退回。"
     if kind in DEVELOPMENT_QUESTIONS:
         intro = {
             "design_clarify": "",
@@ -176,6 +184,10 @@ def chat_answer(request: dict, text: str, replies: list[str], model: ModelRunner
     kind, payload = request["kind"], request["payload"]
     if text.rstrip("。！!") in {"结束并保留结果", "结束任务"}:
         value = {"stop": True}
+    elif kind in APPROVAL_QUESTIONS:
+        if text.rstrip("。！!") not in {"确认", "同意", "通过"}:
+            raise ValueError("请使用规格或计划下方的确认表单，也可以回复「结束并保留结果」。")
+        value = {"approve": True, "snapshot": payload["snapshot"]}
     elif kind in DEVELOPMENT_QUESTIONS:
         questions = payload["questions"]
         options = questions[0].get("options", []) if len(questions) == 1 else []
@@ -243,6 +255,8 @@ def structured_reply(answer: dict) -> str:
     value = answer["value"]
     if value == {"stop": True}:
         return "结束并保留结果。"
+    if value.get("action") == "edit_plan":
+        return answer["reason"]
     if "reply" in value:
         return value["reply"]
     if "choice" in value:

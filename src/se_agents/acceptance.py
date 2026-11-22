@@ -202,7 +202,7 @@ def verify_project(
                 }
             )
             args = (
-                [sys.executable, "-I", "-S", "-u"]
+                [sys.executable, "-X", "utf8", "-I", "-S", "-u"]
                 if python
                 else [
                     node,
@@ -239,7 +239,7 @@ def verify_project(
                 ]
             )
             entry_command = plan.startup_args()
-            entry_prefix = [sys.executable] if python else args
+            entry_prefix = [sys.executable, "-X", "utf8"] if python else args
             tick = time.monotonic()
             model.store.activity(model.run_id, "运行项目自动化测试")
             with (

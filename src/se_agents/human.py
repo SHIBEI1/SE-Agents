@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from .planning import DevelopmentPlan, PlanEdit, edited_plan
 from .schemas import Frame, canonical
 
 DEVELOPMENT_QUESTIONS = {"design_clarify", "project_clarify", "project_review_clarify"}
+APPROVAL_QUESTIONS = {"proposal_confirm", "requirements_confirm", "design_confirm", "plan_confirm"}
 
 
 def validate_answer(request: dict, answer: dict) -> None:
@@ -18,7 +20,25 @@ def validate_answer(request: dict, answer: dict) -> None:
         return
     kind = request["kind"]
     payload = request["payload"]
-    if kind in DEVELOPMENT_QUESTIONS:
+    if kind == "plan_confirm" and value.get("action") == "edit_plan":
+        if value.get("snapshot") != payload["snapshot"]:
+            raise ValueError("任务计划已更新，请刷新后再编辑。")
+        edit = PlanEdit.model_validate(value.get("edit"))
+        edited_plan(DevelopmentPlan.model_validate(payload["document"]), edit)
+        return
+    if kind in APPROVAL_QUESTIONS:
+        if type(value.get("approve")) is not bool or value.get("snapshot") != payload["snapshot"]:
+            raise ValueError("确认必须对应当前规格或任务计划版本。")
+        if value["approve"] and payload.get("approval_blocked"):
+            raise ValueError("计划还有重大评审问题，请提交修改意见后重新评审。")
+        if value["approve"] and payload.get("needs_risk_ack") and value.get("risk_ack") is not True:
+            raise ValueError("请先查看并确认遗留风险。")
+        feedback = value.get("feedback", "")
+        if not isinstance(feedback, str) or len(feedback) > 2400:
+            raise ValueError("修改意见须为最多 2400 字符的文本。")
+        if not value["approve"] and not feedback.strip():
+            raise ValueError("退回时请填写修改意见。")
+    elif kind in DEVELOPMENT_QUESTIONS:
         reply = value.get("reply")
         if not isinstance(reply, str) or not 1 <= len(reply.strip()) <= 2400:
             raise ValueError("请用自然语言回复，也可以说「你决定」。")
