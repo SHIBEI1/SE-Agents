@@ -28,6 +28,7 @@ from se_agents.presentation import (
     ranking_rows,
     zh,
 )
+from se_agents.project_summary import render_project_summary
 from se_agents.reporting import export_json, export_markdown, technical_body
 from se_agents.schemas import DIMENSIONS, ROLE_NAMES
 from se_agents.service import Busy, Service
@@ -138,6 +139,8 @@ def running(run_id: str) -> None:
     future = st.session_state.get("work")
     if (future is not None and future.done()) or (future is None and run["status"] != "running"):
         st.rerun()
+    render_project_summary(summary_slot, service.store.board(run_id, run["revision"]), run,
+                           store=service.store)
     activity_panel(run, live=True)
     render_engineering(service, run_id, service.store.board(run_id), schedule_task, live=True)
     if st.button("停止任务", key=f"cancel-{run_id}"):
@@ -388,6 +391,9 @@ config = service.config(run_id)
 st.title(run["name"])
 status = "构建中" if board.project_build and run["status"] == "running" else STATUS[run["status"]]
 st.caption(f"{status} · {'历史模拟记录' if config.mode == 'mock' else config.model}")
+request = service.request(run_id) if config.mode != "mock" else None
+summary_slot = st.empty()
+render_project_summary(summary_slot, board, run, request, store=service.store)
 if not active:
     task_controls(run_id, run)
 transcript = service.store.chat_messages(run_id)
@@ -433,7 +439,7 @@ if plan_failed:
     if st.button("继续任务", key=f"resume-plan-{run_id}"):
         schedule(run_id)
 
-request = service.request(run_id) if config.mode != "mock" else None
+st.markdown('<div id="project-actions"></div>', unsafe_allow_html=True)
 approval_slot = render_engineering(service, run_id, board, schedule_task, request=request)
 
 if request:

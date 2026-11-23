@@ -498,6 +498,7 @@ def test_front_page_and_planning_dashboard(tmp_path, engineering_replies, monkey
     assert not app.exception
     next(button for button in app.button if button.key == f"select-{run}").click().run()
     assert not app.exception
+    assert "当前进展与待办" in {item.label for item in app.expander}
     assert {tab.label for tab in app.tabs} >= {
         "任务依赖图", "执行批次与时间", "执行看板", "追溯与导出",
     }
